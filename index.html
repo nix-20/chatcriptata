@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Chat Criptata E2E</title>
+  <style>
+    body { font-family: sans-serif; max-width: 600px; margin: 30px auto; }
+    #chat { border: 1px solid #ccc; padding: 10px; height: 300px; overflow-y: scroll; margin-top: 10px; }
+    input, select, button { margin: 5px 0; padding: 8px; width: 100%; }
+  </style>
+</head>
+<body>
+  <h2>Login / Registrazione</h2>
+  <input id="email" placeholder="Email">
+  <input id="password" type="password" placeholder="Password">
+  <button onclick="register()">Registrati</button>
+  <button onclick="login()">Login</button>
+  <hr>
+  <h2>Chat E2E</h2>
+  <select id="recipient"></select>
+  <input id="message" placeholder="Scrivi un messaggio">
+  <button onclick="sendMessage()">Invia</button>
+  <div id="chat"></div>
+
+  <!-- Firebase SDK -->
+  <script src="https://www.gstatic.com/firebasejs/10.0.0/firebase-app.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.0.0/firebase-auth.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.0.0/firebase-firestore.js"></script>
+
+  <!-- TweetNaCl per crittografia -->
+  <script src="https://cdn.jsdelivr.net/npm/tweetnacl/nacl.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/tweetnacl-util/nacl-util.min.js"></script>
+
+  <script>
+    // Inserisci la tua configurazione Firebase qui
+    const firebaseConfig = {
+  apiKey: "AIzaSyAZ_ew3jUGe3g261iraxqALx9_5LSUCXQ8",
+  authDomain: "chat-6543d.firebaseapp.com",
+  projectId: "chat-6543d",
+  storageBucket: "chat-6543d.firebasestorage.app",
+  messagingSenderId: "960913649179",
+  appId: "1:960913649179:web:85476e659ad66a7d2b52be"
+};
+    firebase.initializeApp(firebaseConfig);
+    const auth = firebase.auth();
+    const db = firebase.firestore();
+
+    let myKeyPair = null;  // coppia chiavi locali
+    let myEmail = null;
+
+    async function register() {
+      const email = document.getElementById('email').value;
+      const password = document.getElementById('password').value;
+      await auth.createUserWithEmailAndPassword(email, password);
+      myEmail = email;
+
+      // genera coppia chiavi
+      myKeyPair = nacl.box.keyPair();
+
+      // salva chiave pubblica nel DB
+      const publicKeyBase64 = nacl.util.encodeBase64(myKeyPair.publicKey);
+      await db.collection("users").doc(email).set({ publicKey: publicKeyBase64 });
+
+      alert("Registrazione completata!");
+      await loadUsers();
+      listenForMessages();
+    }
+
+    async function login() {
+      const email = document.getElementById('email').value;
+      const password = document.getElementById('password').value;
+      await auth.signInWithEmailAndPassword(email, password);
+      myEmail = email;
+
+      // genera nuova coppia chiavi (per semplicità)
+      myKeyPair = nacl.box.keyPair();
+
+      // aggiorna chiave pubblica nel DB
+      const publicKeyBase64 = nacl.util.encodeBase64(myKeyPair.publicKey);
+      await db.collection("users").doc(email).set({ publicKey: publicKeyBase64 });
+
+      alert("Login effettuato!");
+      await loadUsers();
+      listenForMessages();
+    }
+
+    async function loadUsers() {
+      const select = document.getElementById('recipient');
+      select.innerHTML = '';
+      const snapshot = await db.collection("users").get();
+      snapshot.forEach(doc => {
+        const userEmail = doc.id;
+        if (userEmail !== myEmail) {
+          const option = document.createElement('option');
+          option.value = userEmail;
+          option.textContent = userEmail;
+          select.appendChild(option);
+        }
+      });
+    }
+
+    async function sendMessage() {
+      const recipientEmail = document.getElementById('recipient').value;
+      const message = document.getElementById('message').value;
+
+      // prendi chiave pubblica destinatario
+      const doc = await db.collection("users").doc(recipientEmail).get();
+      if (!doc.exists) return alert("Destinatario non trovato");
+      const recipientPubKeyBase64 = doc.data().publicKey;
+      const recipientPubKey = nacl.util.decodeBase64(recipientPubKeyBase64);
+
+      // crea nonce casuale
+      const nonce = nacl.randomBytes(24);
+      const messageUint8 = nacl.util.decodeUTF8(message);
+
+      // cripta messaggio
+      const encrypted = nacl.box(messageUint8, nonce, recipientPubKey, myKeyPair.secretKey);
+
+      // salva su Firestore
+      await db.collection("messages").add({
+        from: myEmail,
+        to: recipientEmail,
+        nonce: nacl.util.encodeBase64(nonce),
+        encrypted: nacl.util.encodeBase64(encrypted),
+        timestamp: firebase.firestore.FieldValue.serverTimestamp()
+      });
+
+      document.getElementById('message').value = '';
+    }
+
+    function listenForMessages() {
+      db.collection("messages")
+        .where("to", "==", myEmail)
+        .orderBy("timestamp")
+        .onSnapshot(snapshot => {
+          const chat = document.getElementById('chat');
+          chat.innerHTML = '';
+          snapshot.forEach(doc => {
+            const data = doc.data();
+            const nonce = nacl.util.decodeBase64(data.nonce);
+            const encrypted = nacl.util.decodeBase64(data.encrypted);
+            const senderEmail = data.from;
+
+            // prendi chiave pubblica mittente
+            db.collection("users").doc(senderEmail).get().then(senderDoc => {
+              const senderPubKeyBase64 = senderDoc.data().publicKey;
+              const senderPubKey = nacl.util.decodeBase64(senderPubKeyBase64);
+
+              // decripta messaggio
+              const decryptedUint8 = nacl.box.open(encrypted, nonce, senderPubKey, myKeyPair.secretKey);
+              if (decryptedUint8) {
+                const decryptedMessage = nacl.util.encodeUTF8(decryptedUint8);
+                chat.innerHTML += `<p><b>${senderEmail}:</b> ${decryptedMessage}</p>`;
+              } else {
+                chat.innerHTML += `<p><b>${senderEmail}:</b> [Messaggio non decriptabile]</p>`;
+              }
+            });
+          });
+        });
+    }
+  </script>
+</body>
+</html>
